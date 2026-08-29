@@ -1,0 +1,122 @@
+10PEARLS AQI PREDICTOR
+=====================
+
+WHAT THIS PROJECT DOES
+-----------------------
+Predicts US AQI for the next 24, 48, and 72 hours for three cities:
+Karachi, Lahore, and Islamabad. Data comes from the Open-Meteo Weather
+and Air Quality APIs. Three candidate models (Random Forest, Gradient
+Boosting, Ridge) are trained per horizon and the best one (by RMSE) is
+kept automatically. Everything is served through a live Streamlit
+dashboard.
+
+
+TECH STACK
+-----------
+- Python 3.11
+- pandas, numpy, scikit-learn -- feature engineering and modeling
+- SHAP -- feature importance explanations
+- Backblaze B2 (S3-compatible) -- feature store + model registry
+- GitHub Actions -- scheduled pipelines (hourly features, daily
+  training, one-time manual backfill)
+- Streamlit -- live dashboard, deployed on Streamlit Community Cloud
+
+
+PROJECT STRUCTURE
+-------------------
+src/config.py               cities, horizons, feature settings
+src/open_meteo.py           Open-Meteo API client
+src/storage.py              B2 / Hopsworks / local storage abstraction
+                             (FeatureStore, ModelRegistry, ReportStore)
+src/feature_pipeline.py     hourly: fetch + engineer features
+src/backfill_historical.py  one-off: deep historical backfill
+src/training_pipeline.py    daily: train 3 candidates per horizon,
+                             keep the best
+src/inference_pipeline.py   prediction logic, used live by the
+                             Streamlit app
+src/shap_analysis.py        feature importance plots
+src/baseline_check.py       compares trained models against a naive
+                             persistence baseline
+streamlit_app.py            the dashboard (city picker, live forecasts,
+                             hazard alerts, SHAP panel, pipeline status)
+.github/workflows/          feature_pipeline.yml (hourly),
+                             training_pipeline.yml (daily),
+                             backfill.yml (manual, one-time)
+requirements.txt            core dependencies (includes boto3 for B2)
+.gitignore                  excludes .venv, .env, __pycache__, .idea,
+                             and local_store/ contents
+
+
+HOW PREDICTION ACTUALLY WORKS (TRAIN/SERVE CONSISTENCY)
+----------------------------------------------------------
+For a training row at time T predicting AQI at T+horizon, the weather
+features used are ALSO taken at T+horizon (shifted forward from
+history), not at T. This matters because in production you don't have
+real weather for the future -- you have Open-Meteo's forecast for it.
+Training uses shifted historical weather as a stand-in for what a
+forecast would have said; live inference uses Open-Meteo's actual
+forecast for that same future timestamp. Same feature, same column,
+consistent structure between training and serving.
+
+AQI lag/rolling features are always computed using only values from
+before the current row (shift >= 1), so they never leak future
+information into training.
+
+
+WHERE EACH PIECE ACTUALLY RUNS
+---------------------------------
+- backfill_historical.py   -> GitHub Actions, triggered manually once
+- feature_pipeline.py      -> GitHub Actions, hourly cron
+- training_pipeline.py     -> GitHub Actions, daily cron
+- shap_analysis.py         -> GitHub Actions, daily cron (right after
+                               training)
+- baseline_check.py        -> run manually / on demand
+- Prediction (inference)   -> runs LIVE inside the Streamlit app's own
+                               process, cached for about an hour. Not
+                               run by GitHub Actions at all.
+
+
+STORAGE POLICY
+----------------
+If B2 credentials are configured, EVERYTHING lives in B2 only: models,
+features, SHAP plots, training summaries, and pipeline run-status logs.
+Nothing is written to local disk and nothing is committed to git in
+that mode -- models are streamed to/from B2 purely in memory.
+
+Only when no cloud backend is configured at all does local_store/
+become the real persistent store, and in that fallback mode GitHub
+Actions commits it back into the repo after each run.
+
+
+SETUP
+-------
+1. pip install -r requirements.txt
+2. Make .env and fill in your real B2 credentials
+   (never commit the real .env file).
+3. Run once locally to bootstrap:
+     python src/backfill_historical.py --start YYYY-MM-DD --end YYYY-MM-DD
+     python src/feature_pipeline.py
+     python src/training_pipeline.py
+     python src/shap_analysis.py
+4. Run the dashboard locally:
+     streamlit run streamlit_app.py
+
+
+SEEING WHAT HAPPENED ON EACH RUN
+-----------------------------------
+- Full logs: GitHub repo -> Actions tab -> pick a workflow run.
+- At-a-glance status: the "Pipeline status / logs" panel inside the
+  Streamlit dashboard itself, reading the same status logs.
+
+
+KNOWN LIMITATIONS
+--------------------
+- Accuracy naturally degrades with horizon -- 72h predictions are
+  bounded by how good Open-Meteo's own 72h weather forecast is, not
+  just the model.
+- Evaluation uses a time-based (not random) train/test split, since
+  shuffling time series data leaks future information into training.
+- The persistence-baseline check (src/baseline_check.py) exists
+  specifically to verify the trained models add real value beyond
+  simply assuming AQI doesn't change -- see the project report for the
+  actual comparison results.

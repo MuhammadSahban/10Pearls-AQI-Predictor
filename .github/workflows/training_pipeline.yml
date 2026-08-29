@@ -1,0 +1,54 @@
+name: Training pipeline (daily)
+
+on:
+  schedule:
+    - cron: "30 2 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run training pipeline
+        env:
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+          B2_ENDPOINT_URL: ${{ secrets.B2_ENDPOINT_URL }}
+        run: python src/training_pipeline.py
+
+      - name: Generate SHAP feature-importance plots
+        env:
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+          B2_ENDPOINT_URL: ${{ secrets.B2_ENDPOINT_URL }}
+        run: python src/shap_analysis.py
+
+      # Models, training summary, comparison JSON, SHAP plots, and run-
+      # status logs all go through storage.py's ModelRegistry/ReportStore,
+      # which route straight to B2 whenever it's configured -> nothing
+      # lands in local_store/ at all in that case, so there's nothing to
+      # commit. This step (and everything it commits) is ONLY relevant
+      # when neither Hopsworks nor B2 is configured, i.e. local_store/
+      # is your actual persistent storage.
+      - name: Commit local artifacts (fallback mode only)
+        if: ${{ !secrets.HOPSWORKS_API_KEY && !secrets.B2_KEY_ID }}
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add -f local_store/
+          git diff --cached --quiet || git commit -m "chore: retrain models + update reports [skip ci]"
+          git push

@@ -1,0 +1,31 @@
+# Virtual environment -- never commit, everyone rebuilds it from
+# requirements.txt via `pip install -r requirements.txt`
+.venv/
+venv/
+env/
+
+# Secrets -- NEVER commit this. Real credentials go into GitHub Actions
+# repo secrets and Streamlit Cloud app secrets instead (see README).
+.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Local fallback storage -- only meaningful when neither B2 nor
+# Hopsworks is configured. Ignored here for local-dev hygiene (so your
+# own test runs don't get committed by accident); GitHub Actions uses
+# `git add -f` to override this specifically when it needs to persist
+# local_store/ back to the repo in that fallback mode.
+local_store/*
+!local_store/.gitkeep
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
