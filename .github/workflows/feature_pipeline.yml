@@ -16,6 +16,8 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+    env:
+      HAS_CLOUD_BACKEND: ${{ secrets.HOPSWORKS_API_KEY != '' || secrets.B2_KEY_ID != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -40,7 +42,7 @@ jobs:
       # (parquet feature file) back into the repo so tomorrow's training
       # run (and anyone running the app locally) sees today's new rows.
       - name: Commit updated local feature store
-        if: ${{ !secrets.HOPSWORKS_API_KEY && !secrets.B2_KEY_ID }}
+        if: ${{ env.HAS_CLOUD_BACKEND != 'true' }}
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
