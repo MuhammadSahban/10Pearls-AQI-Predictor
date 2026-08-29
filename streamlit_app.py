@@ -57,7 +57,8 @@ def get_prediction_for_city(city, coords, _cache_bust):
     df = inf.add_time_features(df)
     df = inf.add_lag_features(df, "us_aqi")
 
-    observed = aqi.dropna(subset=["us_aqi"]).sort_values("timestamp")
+    now_ts = inf.get_now_anchor(df)
+    observed = aqi[aqi["timestamp"] <= now_ts].dropna(subset=["us_aqi"]).sort_values("timestamp")
     current_aqi = float(observed["us_aqi"].iloc[-1]) if len(observed) else None
 
     result = {

@@ -14,7 +14,7 @@ the dashboard's "Refresh" button.
 """
 import json
 import pathlib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import pandas as pd
 
@@ -24,6 +24,29 @@ from feature_pipeline import add_time_features, add_lag_features
 from storage import ModelRegistry
 
 LOCAL_STORE = pathlib.Path(__file__).resolve().parent.parent / "local_store"
+
+
+def get_now_anchor(df, ts_col="timestamp"):
+    """Returns the row-timestamp in df that represents the TRUE current
+    moment -- NOT just "whatever the last fetched row happens to be."
+
+    The fetch window is past_days=3, forecast_days=4, so the last row
+    in the dataframe is actually ~4 days in the future (the far end of
+    Open-Meteo's own forecast), not "now". Anchoring predictions to
+    that row silently shifted every "current AQI" and every +24h/+48h/
+    +72h target forward by several days.
+
+    Open-Meteo timestamps are already in each city's local time
+    (fetched with timezone="auto"), so "now" here is computed in the
+    same GMT+5 local time and then made timezone-naive to compare
+    directly against those timestamps."""
+    now_actual = pd.Timestamp(datetime.now(timezone(timedelta(hours=5)))).tz_localize(None).floor("h")
+    past_or_present = df[df[ts_col] <= now_actual]
+    if len(past_or_present):
+        return past_or_present[ts_col].max()
+    # Fallback for the edge case where every fetched row is somehow in
+    # the future (e.g. clock skew) -> nearest timestamp overall.
+    return df.iloc[(df[ts_col] - now_actual).abs().argsort().iloc[0]][ts_col]
 
 
 def aqi_category(aqi):
@@ -43,8 +66,8 @@ def aqi_category(aqi):
 
 
 def get_feature_row(city_df, horizon, feature_cols):
+    now_ts = get_now_anchor(city_df)
     latest = city_df.sort_values("timestamp").iloc[[-1]].copy()
-    now_ts = latest["timestamp"].iloc[0]
     target_ts = now_ts + pd.Timedelta(hours=horizon)
 
     row = latest.copy()
@@ -79,7 +102,8 @@ def run():
         df = add_time_features(df)
         df = add_lag_features(df, "us_aqi")
 
-        observed = aqi.dropna(subset=["us_aqi"]).sort_values("timestamp")
+        now_ts = get_now_anchor(df)
+        observed = aqi[aqi["timestamp"] <= now_ts].dropna(subset=["us_aqi"]).sort_values("timestamp")
         current_aqi = float(observed["us_aqi"].iloc[-1]) if len(observed) else None
 
         city_result = {
