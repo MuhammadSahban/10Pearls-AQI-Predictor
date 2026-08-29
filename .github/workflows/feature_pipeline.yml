@@ -9,8 +9,6 @@ name: Feature pipeline (hourly)
 # that are up to an hour stale from a scheduled run.
 
 on:
-  schedule:
-    - cron: "56 * * * *"
   workflow_dispatch: {}
 
 jobs:
