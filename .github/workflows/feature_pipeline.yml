@@ -10,7 +10,7 @@ name: Feature pipeline (hourly)
 
 on:
   schedule:
-    - cron: "25 * * * *"
+    - cron: "56 * * * *"
   workflow_dispatch: {}
 
 jobs:
