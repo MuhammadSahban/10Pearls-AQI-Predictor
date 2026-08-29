@@ -1,0 +1,50 @@
+name: Feature pipeline (hourly)
+
+# Only responsible for keeping the feature store fresh with new
+# weather + AQI data. Predictions are no longer computed here -- the
+# Streamlit app computes them live (see streamlit_app.py), pulling the
+# latest data straight from Open-Meteo and the latest model straight
+# from Hopsworks each time its cache expires. This keeps this workflow
+# fast and gives the dashboard truly live numbers instead of numbers
+# that are up to an hour stale from a scheduled run.
+
+on:
+  schedule:
+    - cron: "5 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-b2.txt
+
+      - name: Run feature pipeline
+        env:
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
+          B2_ENDPOINT_URL: ${{ secrets.B2_ENDPOINT_URL }}
+        run: python src/feature_pipeline.py
+
+      # Only relevant when NOT using Hopsworks: persist local_store/
+      # (parquet feature file) back into the repo so tomorrow's training
+      # run (and anyone running the app locally) sees today's new rows.
+      - name: Commit updated local feature store
+        if: ${{ !secrets.HOPSWORKS_API_KEY && !secrets.B2_KEY_ID }}
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add local_store/
+          git diff --cached --quiet || git commit -m "chore: update features [skip ci]"
+          git push
