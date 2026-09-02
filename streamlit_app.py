@@ -160,7 +160,34 @@ def render_city(city_result):
         if city_result["recent_history"]:
             hist_df = pd.DataFrame(city_result["recent_history"])
             hist_df["timestamp"] = pd.to_datetime(hist_df["timestamp"])
-            st.line_chart(hist_df.set_index("timestamp")["us_aqi"], height=220)
+            hist_df = hist_df.rename(columns={"us_aqi": "Observed (past 72h)"})
+
+            if city_result["forecasts"]:
+                # Bridge the two series at the current point (same
+                # timestamp in both) so the historical line visually
+                # connects into the forecast line rather than looking
+                # like two unrelated charts.
+                forecast_rows = [{
+                    "timestamp": pd.to_datetime(city_result["current_time"]),
+                    "Forecast (+24h/+48h/+72h)": city_result["current_aqi"],
+                }]
+                for fc in city_result["forecasts"]:
+                    forecast_rows.append({
+                        "timestamp": pd.to_datetime(fc["target_time"]),
+                        "Forecast (+24h/+48h/+72h)": fc["predicted_aqi"],
+                    })
+                forecast_df = pd.DataFrame(forecast_rows)
+                chart_df = pd.merge(
+                    hist_df[["timestamp", "Observed (past 72h)"]],
+                    forecast_df, on="timestamp", how="outer",
+                )
+                st.caption("Past 72h observed AQI, connecting into the forecast above")
+            else:
+                chart_df = hist_df[["timestamp", "Observed (past 72h)"]]
+                st.caption("Past 72h observed AQI")
+
+            chart_df = chart_df.sort_values("timestamp").set_index("timestamp")
+            st.line_chart(chart_df, height=240)
 
 
 # ---- Page ----
