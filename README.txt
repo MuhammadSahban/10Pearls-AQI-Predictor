@@ -17,8 +17,12 @@ TECH STACK
 - pandas, numpy, scikit-learn -- feature engineering and modeling
 - SHAP -- feature importance explanations
 - Backblaze B2 (S3-compatible) -- feature store + model registry
-- GitHub Actions -- scheduled pipelines (hourly features, daily
-  training, one-time manual backfill)
+- GitHub Actions -- pipeline execution (hourly features, daily
+  training, one-time manual backfill), triggered by an external cron
+  service rather than GitHub's own native schedule (see SCHEDULING
+  below for why)
+- cron-job.org -- external scheduler that reliably
+  triggers the GitHub Actions workflows on time
 - Streamlit -- live dashboard, deployed on Streamlit Community Cloud
 
 
@@ -62,18 +66,53 @@ AQI lag/rolling features are always computed using only values from
 before the current row (shift >= 1), so they never leak future
 information into training.
 
+Live predictions are anchored to the TRUE current time (a fixed GMT+5
+offset, since all three cities are in Pakistan and observe no daylight
+saving), not simply "the last row of fetched data." This matters
+because each live fetch pulls ~3 days of past data plus ~4 days of
+Open-Meteo's own forecast, so "the last row" is actually several days
+in the future -- using it as "now" would have silently shifted every
+prediction and the "current AQI" reading forward by days.
+
 
 WHERE EACH PIECE ACTUALLY RUNS
 ---------------------------------
 - backfill_historical.py   -> GitHub Actions, triggered manually once
-- feature_pipeline.py      -> GitHub Actions, hourly cron
-- training_pipeline.py     -> GitHub Actions, daily cron
-- shap_analysis.py         -> GitHub Actions, daily cron (right after
-                               training)
+- feature_pipeline.py      -> GitHub Actions, triggered hourly by an
+                               external cron service (see SCHEDULING)
+- training_pipeline.py     -> GitHub Actions, triggered daily by the
+                               same external cron service
+- shap_analysis.py         -> GitHub Actions, runs right after
+                               training in the same workflow
 - baseline_check.py        -> run manually / on demand
 - Prediction (inference)   -> runs LIVE inside the Streamlit app's own
-                               process, cached for about an hour. Not
-                               run by GitHub Actions at all.
+                               process, cached for about an hour.
+
+
+SCHEDULING (EXTERNAL CRON, NOT GITHUB'S NATIVE SCHEDULE)
+-------------------------------------------------------------
+GitHub Actions' built-in `schedule:` trigger is best-effort and can be
+delayed significantly, especially around the top of every hour when
+huge numbers of repositories worldwide are all scheduled at once. In
+this project that meant the hourly/daily jobs were not reliably firing
+on time (manual `workflow_dispatch` runs always worked fine and fast,
+confirming the workflows themselves were correct -- it was purely a
+native-scheduling reliability issue).
+
+Fix: the `schedule:` trigger was removed from feature_pipeline.yml and
+training_pipeline.yml entirely. `workflow_dispatch: {}` was kept in
+both, and an external free cron service
+(cron-job.org) is configured to call GitHub's REST API on a schedule:
+
+    POST https://api.github.com/repos/<you>/<repo>/actions/workflows/<workflow-file>.yml/dispatches
+    Authorization: Bearer <fine-grained personal access token>
+    Body: {"ref": "main"}
+
+The token is a fine-grained PAT scoped to ONLY this repository, with
+ONLY "Actions: Read and write" permission -- nothing broader. This
+swaps "GitHub's queued, sometimes-delayed native cron" for "an
+external, reliable trigger of the exact same manual dispatch mechanism
+that was already confirmed to work."
 
 
 STORAGE POLICY
@@ -91,8 +130,8 @@ Actions commits it back into the repo after each run.
 SETUP
 -------
 1. pip install -r requirements.txt
-2. Make .env and fill in your real B2 credentials
-   (never commit the real .env file).
+2. Set your B2 credentials as environment variables (never commit
+   real credentials to the repo).
 3. Run once locally to bootstrap:
      python src/backfill_historical.py --start YYYY-MM-DD --end YYYY-MM-DD
      python src/feature_pipeline.py
