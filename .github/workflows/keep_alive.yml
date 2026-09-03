@@ -1,0 +1,34 @@
+name: Keep Streamlit App Awake
+
+on:
+  workflow_dispatch:
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install chromium
+
+      - name: Visit Streamlit app
+        run: |
+          python - <<'PY'
+          from playwright.sync_api import sync_playwright
+
+          URL = "https://10pearls-aqi-predictor-by-muhammad-sahban.streamlit.app/"
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              page = browser.new_page()
+
+              page.goto(URL, wait_until="domcontentloaded", timeout=120000)
+              page.wait_for_timeout(15000)
+
+              print("Final URL:", page.url)
+              print("Title:", page.title())
+
+              browser.close() 
+          PY
