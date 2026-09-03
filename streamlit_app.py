@@ -19,6 +19,7 @@ import pathlib
 import time
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "src"))
@@ -41,6 +42,111 @@ CATEGORY_COLOR = {
     "Unknown": "#888780",
 }
 
+STATUS_COLOR = {"success": "#639922", "partial": "#BA7517", "failed": "#993C1D"}
+
+# (low, high, category) -> used for both the gauge bands and the sidebar legend
+AQI_BANDS = [
+    (0, 50, "Good"),
+    (50, 100, "Moderate"),
+    (100, 150, "Unhealthy for Sensitive Groups"),
+    (150, 200, "Unhealthy"),
+    (200, 300, "Very Unhealthy"),
+    (300, 400, "Hazardous"),
+]
+
+
+def hex_to_rgba(hex_color, alpha):
+    """Plotly's color properties only accept 6-digit hex or rgb()/rgba()
+    strings -- NOT 8-digit alpha-hex like '#63992230'. This converts a
+    plain hex color + a 0-1 alpha into a valid rgba() string instead."""
+    hex_color = hex_color.lstrip("#")
+    r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def svg_dot(color, size=10):
+    """A small inline SVG circle used as a status/legend marker in place
+    of emoji -- renders identically across every OS/browser, unlike
+    emoji glyphs which vary by platform font."""
+    r = size / 2
+    return (f'<svg width="{size}" height="{size}" style="vertical-align:middle;">'
+            f'<circle cx="{r}" cy="{r}" r="{r}" fill="{color}" /></svg>')
+
+
+def build_gauge(value, category):
+    """A semicircle gauge for the current AQI reading, colored by
+    category, with the full EPA band structure shown as background
+    zones so the reading is immediately contextualized."""
+    color = CATEGORY_COLOR.get(category, "#888780")
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=value if value is not None else 0,
+        number={"font": {"size": 44, "color": color}},
+        gauge={
+            "axis": {"range": [0, 400], "tickcolor": "#888", "tickfont": {"size": 10}},
+            "bar": {"color": color, "thickness": 0.28},
+            "bgcolor": "rgba(0,0,0,0)",
+            "borderwidth": 0,
+            "steps": [{"range": [lo, hi], "color": hex_to_rgba(CATEGORY_COLOR.get(cat, "#888780"), 0.19)}
+                      for lo, hi, cat in AQI_BANDS],
+        },
+    ))
+    fig.update_layout(
+        height=210, margin=dict(l=25, r=25, t=15, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
+
+
+def build_trend_chart(recent_history, forecasts, current_time, current_aqi):
+    """Solid line for observed history, dashed line + markers for the
+    forecast, sharing the current point so they connect visually, with
+    a 'now' marker separating the two."""
+    fig = go.Figure()
+
+    if recent_history:
+        hist_df = pd.DataFrame(recent_history)
+        hist_df["timestamp"] = pd.to_datetime(hist_df["timestamp"])
+        fig.add_trace(go.Scatter(
+            x=hist_df["timestamp"], y=hist_df["us_aqi"],
+            mode="lines", name="Observed",
+            line=dict(color="#4FA8E0", width=2.2),
+        ))
+
+    if forecasts and current_time is not None:
+        fx = [pd.to_datetime(current_time)] + [pd.to_datetime(f["target_time"]) for f in forecasts]
+        fy = [current_aqi] + [f["predicted_aqi"] for f in forecasts]
+        fig.add_trace(go.Scatter(
+            x=fx, y=fy, mode="lines+markers", name="Forecast",
+            line=dict(color="#F2A93B", width=2.2, dash="dash"),
+            marker=dict(size=9, color="#F2A93B", line=dict(width=1.5, color="white")),
+        ))
+        # NOTE: fig.add_vline() is intentionally NOT used here -- with
+        # pandas>=2.x + a datetime x-value, its internal annotation-
+        # positioning code performs Timestamp + int arithmetic that
+        # pandas no longer allows, raising "Addition/subtraction of
+        # integers and integer-arrays with Timestamp is no longer
+        # supported." Building the line + label manually via add_shape/
+        # add_annotation avoids that code path entirely.
+        now_ts = pd.to_datetime(current_time)
+        fig.add_shape(
+            type="line", x0=now_ts, x1=now_ts, y0=0, y1=1, yref="paper",
+            line=dict(dash="dot", color="#888"),
+        )
+        fig.add_annotation(
+            x=now_ts, y=1, yref="paper", yanchor="bottom",
+            text="now", showarrow=False, font=dict(color="#888", size=11),
+        )
+
+    fig.update_layout(
+        height=300, margin=dict(l=10, r=10, t=35, b=10),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="left", x=0),
+        xaxis=dict(title=None, showgrid=False),
+        yaxis=dict(title="AQI", showgrid=True, gridcolor="rgba(128,128,128,0.15)"),
+    )
+    return fig
+
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def get_prediction_for_city(city, coords, _cache_bust):
@@ -61,11 +167,20 @@ def get_prediction_for_city(city, coords, _cache_bust):
     observed = aqi[aqi["timestamp"] <= now_ts].dropna(subset=["us_aqi"]).sort_values("timestamp")
     current_aqi = float(observed["us_aqi"].iloc[-1]) if len(observed) else None
 
+    conditions = {}
+    current_row = df[df["timestamp"] == now_ts]
+    if len(current_row):
+        r = current_row.iloc[0]
+        for key in ("temperature_2m", "relative_humidity_2m", "wind_speed_10m", "pm2_5", "pm10"):
+            val = r.get(key)
+            conditions[key] = round(float(val), 2) if pd.notna(val) else None
+
     result = {
         "city": city,
         "current_aqi": current_aqi,
         "current_category": inf.aqi_category(current_aqi),
         "current_time": str(observed["timestamp"].iloc[-1]) if len(observed) else None,
+        "conditions": conditions,
         "forecasts": [],
         "recent_history": observed.tail(72)[["timestamp", "us_aqi"]]
             .assign(timestamp=lambda d: d["timestamp"].astype(str))
@@ -119,95 +234,136 @@ def load_reports(_cache_bust):
 
 
 def render_city(city_result):
-    left, right = st.columns([1, 3])
+    cat = city_result["current_category"]
+    color = CATEGORY_COLOR.get(cat, "#888780")
 
-    with left:
-        cat = city_result["current_category"]
-        color = CATEGORY_COLOR.get(cat, "#888780")
+    gauge_col, info_col = st.columns([1, 2])
+    with gauge_col:
+        st.plotly_chart(build_gauge(city_result["current_aqi"], cat),
+                         use_container_width=True, config={"displayModeBar": False})
         st.markdown(
-            f"<div style='padding:14px;border-radius:8px;background:{color}22;"
-            f"border:1px solid {color};'>"
-            f"<div style='font-size:13px;color:gray;'>Current AQI</div>"
-            f"<div style='font-size:32px;font-weight:600;'>{city_result['current_aqi']}</div>"
-            f"<div style='color:{color};font-weight:500;'>{cat}</div>"
-            f"<div style='font-size:12px;color:gray;'>as of {city_result['current_time']}</div>"
+            f"<div style='text-align:center;'>"
+            f"<span style='color:{color};font-weight:600;font-size:16px;'>{cat}</span><br>"
+            f"<span style='color:gray;font-size:12px;'>as of {city_result['current_time']}</span>"
             f"</div>",
             unsafe_allow_html=True,
         )
         if cat in ("Unhealthy", "Very Unhealthy", "Hazardous"):
-            st.error(f"⚠️ Hazardous AQI alert: {cat}")
+            st.error(f"Hazardous AQI alert: {cat}")
 
-    with right:
-        if not city_result["forecasts"]:
-            st.info("No trained model available yet for this city — run "
-                    "training_pipeline.py at least once.")
-        else:
+    with info_col:
+        if city_result["forecasts"]:
             fcols = st.columns(len(city_result["forecasts"]))
             for i, fc in enumerate(city_result["forecasts"]):
                 with fcols[i]:
-                    color = CATEGORY_COLOR.get(fc["category"], "#888780")
-                    st.markdown(f"**+{fc['horizon_hours']}h**")
-                    st.markdown(
-                        f"<div style='padding:10px;border-radius:8px;background:{color}22;"
-                        f"border:1px solid {color};'>"
-                        f"<div style='font-size:22px;font-weight:600;'>{fc['predicted_aqi']}</div>"
-                        f"<div style='color:{color};font-size:13px;'>{fc['category']}</div>"
-                        f"</div>",
-                        unsafe_allow_html=True,
+                    delta = None
+                    if city_result["current_aqi"] is not None:
+                        delta = round(fc["predicted_aqi"] - city_result["current_aqi"], 1)
+                    st.metric(
+                        label=f"+{fc['horizon_hours']}h",
+                        value=fc["predicted_aqi"],
+                        delta=delta,
+                        # AQI increasing is bad -> show increases in red, not green
+                        delta_color="inverse",
                     )
-                    st.caption(fc["target_time"])
+                    st.caption(f"{fc['category']}  \u00b7  {fc['target_time'][:16]}")
+        else:
+            st.info("No trained model available yet for this city -- run "
+                    "training_pipeline.py at least once.")
 
-        if city_result["recent_history"]:
-            hist_df = pd.DataFrame(city_result["recent_history"])
-            hist_df["timestamp"] = pd.to_datetime(hist_df["timestamp"])
-            hist_df = hist_df.rename(columns={"us_aqi": "Observed (past 72h)"})
+    # Current conditions get the FULL page width (not squeezed into the
+    # 2/3-width info_col above) -> each of the 5 metrics gets enough
+    # room that values like "30.80 \u00b0C" no longer truncate with "...".
+    cond = city_result.get("conditions", {})
+    if cond:
+        st.markdown("&nbsp;")
+        st.caption("Current conditions")
+        ccols = st.columns(5)
+        fields = [
+            ("Temp", "temperature_2m", "\u00b0C"),
+            ("Humidity", "relative_humidity_2m", "%"),
+            ("Wind", "wind_speed_10m", "m/s"),
+            ("PM2.5", "pm2_5", "\u00b5g/m\u00b3"),
+            ("PM10", "pm10", "\u00b5g/m\u00b3"),
+        ]
+        for col, (label, key, unit) in zip(ccols, fields):
+            val = cond.get(key)
+            col.metric(label, f"{val:.2f} {unit}" if val is not None else "\u2014")
 
-            if city_result["forecasts"]:
-                # Bridge the two series at the current point (same
-                # timestamp in both) so the historical line visually
-                # connects into the forecast line rather than looking
-                # like two unrelated charts.
-                forecast_rows = [{
-                    "timestamp": pd.to_datetime(city_result["current_time"]),
-                    "Forecast (+24h/+48h/+72h)": city_result["current_aqi"],
-                }]
-                for fc in city_result["forecasts"]:
-                    forecast_rows.append({
-                        "timestamp": pd.to_datetime(fc["target_time"]),
-                        "Forecast (+24h/+48h/+72h)": fc["predicted_aqi"],
-                    })
-                forecast_df = pd.DataFrame(forecast_rows)
-                chart_df = pd.merge(
-                    hist_df[["timestamp", "Observed (past 72h)"]],
-                    forecast_df, on="timestamp", how="outer",
-                )
-                st.caption("Past 72h observed AQI, connecting into the forecast above")
-            else:
-                chart_df = hist_df[["timestamp", "Observed (past 72h)"]]
-                st.caption("Past 72h observed AQI")
+        if city_result["forecasts"]:
+            st.markdown("&nbsp;")
+            fcols = st.columns(len(city_result["forecasts"]))
+            for i, fc in enumerate(city_result["forecasts"]):
+                with fcols[i]:
+                    delta = None
+                    if city_result["current_aqi"] is not None:
+                        delta = round(fc["predicted_aqi"] - city_result["current_aqi"], 1)
+                    st.metric(
+                        label=f"+{fc['horizon_hours']}h",
+                        value=fc["predicted_aqi"],
+                        delta=delta,
+                        # AQI increasing is bad -> show increases in red, not green
+                        delta_color="inverse",
+                    )
+                    st.caption(f"{fc['category']}  \u00b7  {fc['target_time'][:16]}")
+        else:
+            st.info("No trained model available yet for this city -- run "
+                    "training_pipeline.py at least once.")
 
-            chart_df = chart_df.sort_values("timestamp").set_index("timestamp")
-            st.line_chart(chart_df, height=240)
+    if city_result["recent_history"] or city_result["forecasts"]:
+        st.plotly_chart(
+            build_trend_chart(city_result["recent_history"], city_result["forecasts"],
+                               city_result["current_time"], city_result["current_aqi"]),
+            use_container_width=True, config={"displayModeBar": False},
+        )
 
 
 # ---- Page ----
 
-st.title("10Pearls AQI Predictor")
-st.caption("Air quality forecasts for the next 24h / 48h / 72h")
+if "cache_bust" not in st.session_state:
+    st.session_state.cache_bust = 0
 
 top_left, top_mid, top_right = st.columns([2, 2, 1])
 with top_left:
-        selected_city = st.selectbox("City", list(CITIES.keys()))
+    st.title("10Pearls AQI Predictor")
+    st.caption("Air quality forecasts for the next 24h / 48h / 72h")
 with top_right:
     st.write("")  # vertical spacer to align button with selectbox
-    refresh_clicked = st.button("🔄 Refresh now")
+    refresh_clicked = st.button("Refresh now")
 
-if "cache_bust" not in st.session_state:
-    st.session_state.cache_bust = 0
 if refresh_clicked:
     get_prediction_for_city.clear()
     load_reports.clear()
     st.session_state.cache_bust += 1
+
+reports = load_reports(st.session_state.cache_bust)
+
+with st.sidebar:
+    st.markdown("### Pearls AQI Predictor")
+    st.caption(
+        "24h / 48h / 72h AQI forecasts for Karachi, Lahore, and Islamabad. "
+        "Live inference, best-of-3 models per horizon, storage backend: "
+        f"**{reports['backend']}**."
+    )
+    st.divider()
+    st.markdown("**EPA AQI scale**")
+    for lo, hi, cat in AQI_BANDS:
+        c = CATEGORY_COLOR.get(cat, "#888780")
+        label = f"{lo}\u2013{hi}" if hi < 400 else f"{lo}+"
+        st.markdown(
+            f"{svg_dot(c)} **{label}** &nbsp;{cat}",
+            unsafe_allow_html=True,
+        )
+    if reports["training_summary"]:
+        st.divider()
+        st.markdown("**Current models**")
+        for horizon_label, info in sorted(reports["training_summary"].items()):
+            st.markdown(
+                f"**{horizon_label}** \u2014 {info['selected_model']} "
+                f"(R\u00b2 {info['metrics']['r2']:.2f})"
+            )
+
+selected_city = st.selectbox("City", list(CITIES.keys()))
 
 with st.spinner(f"Loading {selected_city}'s forecast..."):
     city_result = get_prediction_for_city(
@@ -216,9 +372,7 @@ with st.spinner(f"Loading {selected_city}'s forecast..."):
 
 render_city(city_result)
 
-reports = load_reports(st.session_state.cache_bust)
-
-with st.expander("📊 What drives these predictions? (feature importance)"):
+with st.expander("What drives these predictions? (feature importance)"):
     st.caption(
         "Computed once daily right after training (not live -- SHAP is too "
         "slow to recompute on every page load), so this may lag the very "
@@ -231,7 +385,7 @@ with st.expander("📊 What drives these predictions? (feature importance)"):
     else:
         st.write("Not generated yet — run `python src/shap_analysis.py` after training.")
 
-with st.expander("🛠️ Pipeline status / logs"):
+with st.expander("Pipeline status / logs"):
     st.caption(
         "Lightweight status written by each pipeline's last run. For "
         "full step-by-step logs, see your repo's GitHub Actions tab "
@@ -239,12 +393,15 @@ with st.expander("🛠️ Pipeline status / logs"):
     )
     for pipeline_name, status in reports["run_statuses"].items():
         if status is None:
-            st.write(f"**{pipeline_name}**: no run recorded yet")
+            st.markdown(f"{svg_dot('#888780')} **{pipeline_name}**: no run recorded yet",
+                        unsafe_allow_html=True)
             continue
-        icon = "✅" if status["status"] == "success" else (
-            "⚠️" if status["status"] == "partial" else "❌"
+        dot_color = STATUS_COLOR.get(status["status"], "#888780")
+        st.markdown(
+            f"{svg_dot(dot_color)} **{pipeline_name}** \u2014 {status['status']} "
+            f"at {status['timestamp']}",
+            unsafe_allow_html=True,
         )
-        st.write(f"{icon} **{pipeline_name}** — {status['status']} at {status['timestamp']}")
         if status.get("details"):
             st.json(status["details"], expanded=False)
 
