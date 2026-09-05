@@ -45,7 +45,7 @@ def build_city_features(city, lat, lon, past_days=60, forecast_days=1):
     return df
 
 
-def run(past_days=5):
+def run(past_days=60):
     fs = FeatureStore()
     frames = []
     for city, coords in CITIES.items():

@@ -11,6 +11,12 @@ kept automatically. Everything is served through a live Streamlit
 dashboard.
 
 
+LIVE DEMO
+---------
+Live Dashboard:
+https://10pearls-aqi-predictor-by-muhammad-sahban.streamlit.app/
+
+
 TECH STACK
 -----------
 - Python 3.11
@@ -19,8 +25,7 @@ TECH STACK
 - Backblaze B2 (S3-compatible) -- feature store + model registry
 - GitHub Actions -- pipeline execution (hourly features, daily
   training, one-time manual backfill), triggered by an external cron
-  service rather than GitHub's own native schedule (see SCHEDULING
-  below for why)
+  service rather than GitHub's own native schedule
 - cron-job.org -- external scheduler that reliably
   triggers the GitHub Actions workflows on time
 - Streamlit -- live dashboard, deployed on Streamlit Community Cloud
@@ -45,7 +50,8 @@ streamlit_app.py            the dashboard (city picker, live forecasts,
                              hazard alerts, SHAP panel, pipeline status)
 .github/workflows/          feature_pipeline.yml (hourly),
                              training_pipeline.yml (daily),
-                             backfill.yml (manual, one-time)
+                             backfill.yml (manual, one-time),
+                             keep_alive.yml (every 8 hour)
 requirements.txt            core dependencies (includes boto3 for B2)
 .gitignore                  excludes .venv, .env, __pycache__, .idea,
                              and local_store/ contents
@@ -79,7 +85,7 @@ WHERE EACH PIECE ACTUALLY RUNS
 ---------------------------------
 - backfill_historical.py   -> GitHub Actions, triggered manually once
 - feature_pipeline.py      -> GitHub Actions, triggered hourly by an
-                               external cron service (see SCHEDULING)
+                               external cron service
 - training_pipeline.py     -> GitHub Actions, triggered daily by the
                                same external cron service
 - shap_analysis.py         -> GitHub Actions, runs right after
@@ -88,31 +94,6 @@ WHERE EACH PIECE ACTUALLY RUNS
 - Prediction (inference)   -> runs LIVE inside the Streamlit app's own
                                process, cached for about an hour.
 
-
-SCHEDULING (EXTERNAL CRON, NOT GITHUB'S NATIVE SCHEDULE)
--------------------------------------------------------------
-GitHub Actions' built-in `schedule:` trigger is best-effort and can be
-delayed significantly, especially around the top of every hour when
-huge numbers of repositories worldwide are all scheduled at once. In
-this project that meant the hourly/daily jobs were not reliably firing
-on time (manual `workflow_dispatch` runs always worked fine and fast,
-confirming the workflows themselves were correct -- it was purely a
-native-scheduling reliability issue).
-
-Fix: the `schedule:` trigger was removed from feature_pipeline.yml and
-training_pipeline.yml entirely. `workflow_dispatch: {}` was kept in
-both, and an external free cron service
-(cron-job.org) is configured to call GitHub's REST API on a schedule:
-
-    POST https://api.github.com/repos/<you>/<repo>/actions/workflows/<workflow-file>.yml/dispatches
-    Authorization: Bearer <fine-grained personal access token>
-    Body: {"ref": "main"}
-
-The token is a fine-grained PAT scoped to ONLY this repository, with
-ONLY "Actions: Read and write" permission -- nothing broader. This
-swaps "GitHub's queued, sometimes-delayed native cron" for "an
-external, reliable trigger of the exact same manual dispatch mechanism
-that was already confirmed to work."
 
 
 STORAGE POLICY
