@@ -9,4 +9,5 @@ shap==0.45.1
 matplotlib==3.8.4
 plotly==5.22.0
 boto3==1.34.144
+streamlit-js-eval==0.1.7
 python-dotenv

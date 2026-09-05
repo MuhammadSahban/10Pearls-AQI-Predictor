@@ -21,7 +21,7 @@ import base64
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-import streamlit.components.v1 as components
+from streamlit_js_eval import streamlit_js_eval
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "src"))
 
@@ -82,35 +82,37 @@ def svg_dot(color, size=10):
 
 
 def init_theme():
-    """Default to the browser/device's current color-scheme preference
-    on first load, remembered afterward via session_state.
+    """Default to the browser/device's current color-scheme preference,
+    re-detected fresh on every new session (including every real
+    browser refresh, since that wipes session_state entirely).
 
-    IMPORTANT: this must return immediately if session_state.theme is
-    already set, from EITHER the initial query-param handoff below OR a
-    later manual toggle -- otherwise, since the query param still holds
-    whatever the page loaded with, re-reading it on every rerun would
-    silently overwrite a manual toggle back to the stale original value
-    on the very next interaction."""
-    if "theme" in st.session_state:
+    Why the previous version was broken: it tried to force a page
+    navigation (window.parent.location.search = ...) from INSIDE a
+    components.html() sandboxed iframe. Browsers block exactly this by
+    default -- an embedded iframe isn't allowed to redirect the page
+    that contains it. That JS silently failed on every load, so the
+    Python fallback of "light" is all that ever actually ran, no
+    matter what the device's real setting was.
+
+    Fix: streamlit_js_eval runs JS and returns its result directly into
+    Python via Streamlit's real custom-component protocol -- a proper
+    bidirectional bridge, not a navigation hack. On the very first pass
+    of a fresh session it returns None (the component needs one round
+    trip to resolve), so a temporary placeholder is used for that one
+    render only; a confirmed flag ensures a later MANUAL toggle is never
+    re-clobbered by this detection logic re-running."""
+    if st.session_state.get("theme_confirmed"):
         return
-    qp_theme = st.query_params.get("theme")
-    if qp_theme in ("light", "dark"):
-        st.session_state.theme = qp_theme
-        return
-    st.session_state.theme = "light"  # sensible fallback before JS reports back
-    components.html(
-        """
-        <script>
-        const params = new URLSearchParams(window.parent.location.search);
-        if (!params.has('theme')) {
-            const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-            params.set('theme', dark ? 'dark' : 'light');
-            window.parent.location.search = params.toString();
-        }
-        </script>
-        """,
-        height=0,
+    prefers_dark = streamlit_js_eval(
+        js_expressions="window.matchMedia('(prefers-color-scheme: dark)').matches",
+        key="prefers_dark_check",
     )
+    if prefers_dark is not None:
+        st.session_state.theme = "dark" if prefers_dark else "light"
+        st.session_state.theme_confirmed = True
+    elif "theme" not in st.session_state:
+        st.stop()
+        # st.session_state.theme = "light"  # placeholder for this one render only
 
 
 def inject_theme_css(theme):
