@@ -202,6 +202,7 @@ class FeatureStore:
             buf = io.BytesIO()
             df.to_parquet(buf, index=False)
             _with_retries(self.client.put_object, Bucket=self.bucket, Key=key, Body=buf.getvalue())
+            return df
 
         else:
             LOCAL_DIR.mkdir(parents=True, exist_ok=True)

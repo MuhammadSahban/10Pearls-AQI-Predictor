@@ -16,11 +16,12 @@ the repo after each training run -- see .github/workflows/training_pipeline.yml)
 """
 import sys
 import pathlib
-import time
+import base64
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "src"))
 
@@ -28,7 +29,7 @@ from config import CITIES  # noqa: E402
 import inference_pipeline as inf  # noqa: E402
 from storage import ModelRegistry, ReportStore  # noqa: E402
 
-st.set_page_config(page_title="10Pearls AQI Predictor", page_icon="🌫️", layout="wide")
+st.set_page_config(page_title="Pearls AQI Predictor", layout="wide")
 
 CACHE_TTL_SECONDS = 60 * 60  # re-check for a new model / new data hourly
 
@@ -44,7 +45,6 @@ CATEGORY_COLOR = {
 
 STATUS_COLOR = {"success": "#639922", "partial": "#BA7517", "failed": "#993C1D"}
 
-# (low, high, category) -> used for both the gauge bands and the sidebar legend
 AQI_BANDS = [
     (0, 50, "Good"),
     (50, 100, "Moderate"),
@@ -54,36 +54,145 @@ AQI_BANDS = [
     (300, 400, "Hazardous"),
 ]
 
+POLLUTANT_FIELDS = [
+    ("pm2_5", "PM2.5"), ("pm10", "PM10"), ("nitrogen_dioxide", "NO\u2082"),
+    ("ozone", "O\u2083"), ("sulphur_dioxide", "SO\u2082"), ("carbon_monoxide", "CO"),
+]
+
+THEMES = {
+    "light": {"bg": "#FFFFFF", "text": "#1A1A1A", "muted": "#6B7280",
+              "card": "#F7F7F8", "border": "#E3E3E6", "grid": "rgba(0,0,0,0.08)"},
+    "dark": {"bg": "#0E1117", "text": "#E8E8E8", "muted": "#9CA3AF",
+             "card": "#1B1F27", "border": "#2C313C", "grid": "rgba(255,255,255,0.10)"},
+}
+
 
 def hex_to_rgba(hex_color, alpha):
     """Plotly's color properties only accept 6-digit hex or rgb()/rgba()
-    strings -- NOT 8-digit alpha-hex like '#63992230'. This converts a
-    plain hex color + a 0-1 alpha into a valid rgba() string instead."""
+    strings -- NOT 8-digit alpha-hex like '#63992230'."""
     hex_color = hex_color.lstrip("#")
     r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
     return f"rgba({r},{g},{b},{alpha})"
 
 
 def svg_dot(color, size=10):
-    """A small inline SVG circle used as a status/legend marker in place
-    of emoji -- renders identically across every OS/browser, unlike
-    emoji glyphs which vary by platform font."""
     r = size / 2
     return (f'<svg width="{size}" height="{size}" style="vertical-align:middle;">'
             f'<circle cx="{r}" cy="{r}" r="{r}" fill="{color}" /></svg>')
 
 
-def build_gauge(value, category):
-    """A semicircle gauge for the current AQI reading, colored by
-    category, with the full EPA band structure shown as background
-    zones so the reading is immediately contextualized."""
+def init_theme():
+    """Default to the browser/device's current color-scheme preference
+    on first load, remembered afterward via session_state.
+
+    IMPORTANT: this must return immediately if session_state.theme is
+    already set, from EITHER the initial query-param handoff below OR a
+    later manual toggle -- otherwise, since the query param still holds
+    whatever the page loaded with, re-reading it on every rerun would
+    silently overwrite a manual toggle back to the stale original value
+    on the very next interaction."""
+    if "theme" in st.session_state:
+        return
+    qp_theme = st.query_params.get("theme")
+    if qp_theme in ("light", "dark"):
+        st.session_state.theme = qp_theme
+        return
+    st.session_state.theme = "light"  # sensible fallback before JS reports back
+    components.html(
+        """
+        <script>
+        const params = new URLSearchParams(window.parent.location.search);
+        if (!params.has('theme')) {
+            const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+            params.set('theme', dark ? 'dark' : 'light');
+            window.parent.location.search = params.toString();
+        }
+        </script>
+        """,
+        height=0,
+    )
+
+
+def inject_theme_css(theme):
+    """The previous version only styled the outer container + metric
+    boxes -- Streamlit's own title/caption/button/selectbox text is
+    rendered using STREAMLIT'S OWN internal theme CSS variables
+    (--text-color, --background-color, etc.), which our earlier CSS
+    never touched. That's why some text stayed dark-on-dark (title,
+    captions, labels) while other elements we DID directly control
+    (Plotly charts, our custom divs) switched correctly.
+
+    Fix: override Streamlit's actual CSS custom properties at :root --
+    that's the same mechanism Streamlit's own config.toml theme setting
+    uses internally, so every native widget that reads var(--text-color)
+    etc. picks up the new value automatically. Explicit !important
+    overrides are added on top for the specific elements (title,
+    caption, buttons, selectbox) confirmed broken, as a safety net."""
+    p = THEMES[theme]
+    st.markdown(
+        f"""
+        <style>
+        :root {{
+            --primary-color: #F2A93B;
+            --background-color: {p['bg']};
+            --secondary-background-color: {p['card']};
+            --text-color: {p['text']};
+        }}
+        .stApp, .stAppHeader {{
+            background-color: {p['bg']} !important;
+            color: {p['text']} !important;
+            transition: background-color 0.35s ease, color 0.35s ease;
+        }}
+        [data-testid="stSidebar"] {{
+            background-color: {p['card']} !important;
+            transition: background-color 0.35s ease;
+        }}
+        [data-testid="stSidebar"] * {{
+            color: {p['text']} !important;
+        }}
+        h1, h2, h3, .stMarkdown, .stMarkdown p, label,
+        [data-testid="stCaptionContainer"], [data-testid="stWidgetLabel"] {{
+            color: {p['text']} !important;
+        }}
+        .stButton > button {{
+            background-color: {p['card']} !important;
+            color: {p['text']} !important;
+            border: 1px solid {p['border']} !important;
+            transition: background-color 0.35s ease, color 0.35s ease;
+        }}
+        [data-testid="stSelectbox"] div[data-baseweb="select"] > div {{
+            background-color: {p['card']} !important;
+            color: {p['text']} !important;
+            border-color: {p['border']} !important;
+        }}
+        [data-testid="stMetric"] {{
+            background-color: {p['card']} !important;
+            border: 1px solid {p['border']};
+            border-radius: 10px;
+            padding: 10px 14px;
+            transition: background-color 0.35s ease, border-color 0.35s ease;
+        }}
+        [data-testid="stMetricLabel"], [data-testid="stMetricValue"] {{
+            color: {p['text']} !important;
+        }}
+        /* stMetricDelta is intentionally left alone -- it carries its
+           own semantic red/green coloring (rising/falling AQI), which
+           must not be flattened to the theme's plain text color. */
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def build_gauge(value, category, theme):
     color = CATEGORY_COLOR.get(category, "#888780")
+    axis_color = THEMES[theme]["text"]
     fig = go.Figure(go.Indicator(
         mode="gauge+number",
         value=value if value is not None else 0,
         number={"font": {"size": 44, "color": color}},
         gauge={
-            "axis": {"range": [0, 400], "tickcolor": "#888", "tickfont": {"size": 10}},
+            "axis": {"range": [0, 400], "tickcolor": axis_color, "tickfont": {"size": 10, "color": axis_color}},
             "bar": {"color": color, "thickness": 0.28},
             "bgcolor": "rgba(0,0,0,0)",
             "borderwidth": 0,
@@ -91,71 +200,114 @@ def build_gauge(value, category):
                       for lo, hi, cat in AQI_BANDS],
         },
     ))
-    fig.update_layout(
-        height=210, margin=dict(l=25, r=25, t=15, b=0),
-        paper_bgcolor="rgba(0,0,0,0)",
-    )
+    fig.update_layout(height=210, margin=dict(l=25, r=25, t=15, b=0),
+                       paper_bgcolor="rgba(0,0,0,0)", font=dict(color=axis_color))
     return fig
 
 
-def build_trend_chart(recent_history, forecasts, current_time, current_aqi):
-    """Solid line for observed history, dashed line + markers for the
-    forecast, sharing the current point so they connect visually, with
-    a 'now' marker separating the two."""
+def build_trend_chart(recent_history, forecasts, current_time, current_aqi, theme):
+    p = THEMES[theme]
     fig = go.Figure()
-
     if recent_history:
         hist_df = pd.DataFrame(recent_history)
         hist_df["timestamp"] = pd.to_datetime(hist_df["timestamp"])
-        fig.add_trace(go.Scatter(
-            x=hist_df["timestamp"], y=hist_df["us_aqi"],
-            mode="lines", name="Observed",
-            line=dict(color="#4FA8E0", width=2.2),
-        ))
-
+        fig.add_trace(go.Scatter(x=hist_df["timestamp"], y=hist_df["us_aqi"], mode="lines",
+                                  name="Observed", line=dict(color="#4FA8E0", width=2.2)))
     if forecasts and current_time is not None:
         fx = [pd.to_datetime(current_time)] + [pd.to_datetime(f["target_time"]) for f in forecasts]
         fy = [current_aqi] + [f["predicted_aqi"] for f in forecasts]
-        fig.add_trace(go.Scatter(
-            x=fx, y=fy, mode="lines+markers", name="Forecast",
-            line=dict(color="#F2A93B", width=2.2, dash="dash"),
-            marker=dict(size=9, color="#F2A93B", line=dict(width=1.5, color="white")),
-        ))
-        # NOTE: fig.add_vline() is intentionally NOT used here -- with
-        # pandas>=2.x + a datetime x-value, its internal annotation-
-        # positioning code performs Timestamp + int arithmetic that
-        # pandas no longer allows, raising "Addition/subtraction of
-        # integers and integer-arrays with Timestamp is no longer
-        # supported." Building the line + label manually via add_shape/
+        fig.add_trace(go.Scatter(x=fx, y=fy, mode="lines+markers", name="Forecast",
+                                  line=dict(color="#F2A93B", width=2.2, dash="dash"),
+                                  marker=dict(size=9, color="#F2A93B", line=dict(width=1.5, color="white"))))
+        # add_vline() is intentionally NOT used -- with pandas>=2.x + a
+        # datetime x-value its internal code does Timestamp + int
+        # arithmetic that pandas no longer allows. add_shape/
         # add_annotation avoids that code path entirely.
         now_ts = pd.to_datetime(current_time)
-        fig.add_shape(
-            type="line", x0=now_ts, x1=now_ts, y0=0, y1=1, yref="paper",
-            line=dict(dash="dot", color="#888"),
-        )
-        fig.add_annotation(
-            x=now_ts, y=1, yref="paper", yanchor="bottom",
-            text="now", showarrow=False, font=dict(color="#888", size=11),
-        )
-
+        fig.add_shape(type="line", x0=now_ts, x1=now_ts, y0=0, y1=1, yref="paper",
+                      line=dict(dash="dot", color=p["muted"]))
+        fig.add_annotation(x=now_ts, y=1, yref="paper", yanchor="bottom", text="now",
+                           showarrow=False, font=dict(color=p["muted"], size=11))
     fig.update_layout(
         height=300, margin=dict(l=10, r=10, t=35, b=10),
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="left", x=0),
-        xaxis=dict(title=None, showgrid=False),
-        yaxis=dict(title="AQI", showgrid=True, gridcolor="rgba(128,128,128,0.15)"),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(color=p["text"]),
+        legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="left", x=0,
+                    font=dict(color=p["text"])),
+        xaxis=dict(title=None, showgrid=False, tickfont=dict(color=p["text"])),
+        yaxis=dict(title="AQI", showgrid=True, gridcolor=p["grid"],
+                   tickfont=dict(color=p["text"]), title_font=dict(color=p["text"])),
     )
     return fig
+
+
+def build_pollutant_chart(pollutants, theme):
+    """Horizontal bar chart of raw pollutant concentrations. Log x-axis
+    because CO is typically reported in the hundreds (\u00b5g/m\u00b3)
+    while the others are single/double digits -- a linear axis would
+    make everything except CO invisible."""
+    p = THEMES[theme]
+    labels, values, colors = [], [], []
+    palette = ["#4FA8E0", "#63A375", "#D8A13B", "#C97BB0", "#E0776A", "#9B8ED6"]
+    for i, (key, label) in enumerate(POLLUTANT_FIELDS):
+        val = pollutants.get(key)
+        if val is not None:
+            labels.append(label)
+            values.append(max(val, 0.01))  # log axis can't plot 0
+            colors.append(palette[i % len(palette)])
+    fig = go.Figure(go.Bar(x=values, y=labels, orientation="h", marker_color=colors,
+                            text=[f"{v:.2f}" for v in values], textposition="outside",
+                            textfont=dict(color=p["text"]),cliponaxis=False))
+    fig.update_layout(
+        height=300, margin=dict(l=10, r=30, t=10, b=30),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(color=p["text"]),
+        xaxis=dict(title="\u00b5g/m\u00b3 (log scale)", type="log", gridcolor=p["grid"],
+                   tickfont=dict(color=p["text"]), title_font=dict(color=p["text"])),
+        yaxis=dict(autorange="reversed", tickfont=dict(color=p["text"])),
+    )
+    return fig
+
+
+def build_city_comparison_chart(city_aqis, theme):
+    """Current AQI across all three cities side by side, each bar
+    colored by its own EPA category."""
+    p = THEMES[theme]
+    cities = list(city_aqis.keys())
+    values = [city_aqis[c]["aqi"] if city_aqis[c]["aqi"] is not None else 0 for c in cities]
+    colors = [CATEGORY_COLOR.get(city_aqis[c]["category"], "#888780") for c in cities]
+    fig = go.Figure(go.Bar(x=cities, y=values, marker_color=colors,
+                            text=[f"{v:.1f}" for v in values], textposition="outside",
+                            textfont=dict(color=p["text"]),cliponaxis=False))
+    fig.update_layout(
+        height=260, margin=dict(l=10, r=10, t=10, b=10),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(color=p["text"]),
+        xaxis=dict(showgrid=False, tickfont=dict(color=p["text"])),
+        yaxis=dict(title="Current AQI", gridcolor=p["grid"],
+                   tickfont=dict(color=p["text"]), title_font=dict(color=p["text"])),
+    )
+    return fig
+
+
+def render_image_on_white(img_bytes, caption):
+    """SHAP plots are pre-rendered PNGs (matplotlib, white background)
+    coming from ReportStore/B2 -- their background can't be changed
+    after the fact. Rather than let a stark white rectangle float
+    directly on a dark theme, wrap it in an explicit white card with
+    padding/border so it reads as an intentional design choice in
+    both themes, not a visual glitch."""
+    b64 = base64.b64encode(img_bytes).decode()
+    st.markdown(
+        f'<div style="background:#ffffff;padding:14px;border-radius:10px;'
+        f'border:1px solid #e3e3e6;margin-bottom:10px;">'
+        f'<img src="data:image/png;base64,{b64}" style="width:100%;border-radius:4px;" />'
+        f'<div style="text-align:center;color:#555;font-size:12px;padding-top:6px;">{caption}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def get_prediction_for_city(city, coords, _cache_bust):
-    """One city at a time, so switching cities in the picker doesn't
-    force recomputation of cities you're not currently viewing.
-    `_cache_bust` is unused inside but lets the Refresh button force a
-    fresh computation by changing its value (Streamlit caches on args)."""
     mr = ModelRegistry()
-
     weather = inf.fetch_weather(coords["lat"], coords["lon"], past_days=3, forecast_days=4)
     aqi = inf.fetch_air_quality(coords["lat"], coords["lon"], past_days=3, forecast_days=4)
     df = pd.merge(weather, aqi, on="timestamp", how="inner")
@@ -167,13 +319,16 @@ def get_prediction_for_city(city, coords, _cache_bust):
     observed = aqi[aqi["timestamp"] <= now_ts].dropna(subset=["us_aqi"]).sort_values("timestamp")
     current_aqi = float(observed["us_aqi"].iloc[-1]) if len(observed) else None
 
-    conditions = {}
+    conditions, pollutants = {}, {}
     current_row = df[df["timestamp"] == now_ts]
     if len(current_row):
         r = current_row.iloc[0]
         for key in ("temperature_2m", "relative_humidity_2m", "wind_speed_10m", "pm2_5", "pm10"):
             val = r.get(key)
             conditions[key] = round(float(val), 2) if pd.notna(val) else None
+        for key, _ in POLLUTANT_FIELDS:
+            val = r.get(key)
+            pollutants[key] = round(float(val), 2) if pd.notna(val) else None
 
     result = {
         "city": city,
@@ -181,6 +336,7 @@ def get_prediction_for_city(city, coords, _cache_bust):
         "current_category": inf.aqi_category(current_aqi),
         "current_time": str(observed["timestamp"].iloc[-1]) if len(observed) else None,
         "conditions": conditions,
+        "pollutants": pollutants,
         "forecasts": [],
         "recent_history": observed.tail(72)[["timestamp", "us_aqi"]]
             .assign(timestamp=lambda d: d["timestamp"].astype(str))
@@ -199,22 +355,11 @@ def get_prediction_for_city(city, coords, _cache_bust):
             "predicted_aqi": round(pred, 1),
             "category": inf.aqi_category(pred),
         })
-
     return result
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def load_reports(_cache_bust):
-    """One shared, cached read of everything ReportStore holds: SHAP
-    plot bytes, training summary, and each pipeline's last-run status.
-    This is the answer to "how does the dashboard see files that only
-    exist in the cloud (or only get committed to git)?" -> it doesn't
-    read local_store/ paths directly at all anymore. It goes through
-    the exact same ReportStore that feature_pipeline.py,
-    training_pipeline.py, and shap_analysis.py write to -> if B2 is
-    configured, that's B2 for everyone; if not, it's local_store/reports/,
-    which is what GitHub Actions commits back into the repo that this
-    Streamlit app is deployed from (same checkout, same files)."""
     rs = ReportStore()
     shap_images = {}
     for horizon in [24, 48, 72]:
@@ -225,111 +370,114 @@ def load_reports(_cache_bust):
     run_statuses = {}
     for pipeline in ["feature_pipeline", "training_pipeline", "shap_analysis"]:
         run_statuses[pipeline] = rs.load_json(f"status_{pipeline}.json")
-    return {
-        "backend": rs.backend,
-        "shap_images": shap_images,
-        "training_summary": training_summary,
-        "run_statuses": run_statuses,
-    }
+    return {"backend": rs.backend, "shap_images": shap_images,
+            "training_summary": training_summary, "run_statuses": run_statuses}
 
 
-def render_city(city_result):
+def render_city(city_result, theme):
     cat = city_result["current_category"]
     color = CATEGORY_COLOR.get(cat, "#888780")
 
-    gauge_col, info_col = st.columns([1, 2])
-    with gauge_col:
-        st.plotly_chart(build_gauge(city_result["current_aqi"], cat),
-                         use_container_width=True, config={"displayModeBar": False})
-        st.markdown(
-            f"<div style='text-align:center;'>"
-            f"<span style='color:{color};font-weight:600;font-size:16px;'>{cat}</span><br>"
-            f"<span style='color:gray;font-size:12px;'>as of {city_result['current_time']}</span>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-        if cat in ("Unhealthy", "Very Unhealthy", "Hazardous"):
-            st.error(f"Hazardous AQI alert: {cat}")
+    with st.container(border=True):
+        gauge_col, info_col = st.columns([1, 2])
+        with gauge_col:
+            st.plotly_chart(build_gauge(city_result["current_aqi"], cat, theme),
+                             use_container_width=True, config={"displayModeBar": False})
+            st.markdown(
+                f"<div style='text-align:center;'>"
+                f"<span style='color:{color};font-weight:600;font-size:16px;'>{cat}</span><br>"
+                f"<span style='color:gray;font-size:12px;'>as of {city_result['current_time']}</span>"
+                f"</div>", unsafe_allow_html=True,
+            )
+            if cat in ("Unhealthy", "Very Unhealthy", "Hazardous"):
+                st.error(f"Hazardous AQI alert: {cat}")
 
-    with info_col:
-        if city_result["forecasts"]:
-            fcols = st.columns(len(city_result["forecasts"]))
-            for i, fc in enumerate(city_result["forecasts"]):
-                with fcols[i]:
-                    delta = None
-                    if city_result["current_aqi"] is not None:
-                        delta = round(fc["predicted_aqi"] - city_result["current_aqi"], 1)
-                    st.metric(
-                        label=f"+{fc['horizon_hours']}h",
-                        value=fc["predicted_aqi"],
-                        delta=delta,
-                        # AQI increasing is bad -> show increases in red, not green
-                        delta_color="inverse",
-                    )
-                    st.caption(f"{fc['category']}  \u00b7  {fc['target_time'][:16]}")
-        else:
-            st.info("No trained model available yet for this city -- run "
-                    "training_pipeline.py at least once.")
+        with info_col:
+            if city_result["forecasts"]:
+                fcols = st.columns(len(city_result["forecasts"]))
+                for i, fc in enumerate(city_result["forecasts"]):
+                    with fcols[i]:
+                        delta = None
+                        if city_result["current_aqi"] is not None:
+                            delta = round(fc["predicted_aqi"] - city_result["current_aqi"], 1)
+                        st.metric(label=f"+{fc['horizon_hours']}h", value=fc["predicted_aqi"],
+                                  delta=delta, delta_color="inverse")
+                        st.caption(f"{fc['category']}  \u00b7  {fc['target_time'][:16]}")
+            else:
+                st.info("No trained model available yet for this city -- run "
+                        "training_pipeline.py at least once.")
 
-    # Current conditions get the FULL page width (not squeezed into the
-    # 2/3-width info_col above) -> each of the 5 metrics gets enough
-    # room that values like "30.80 \u00b0C" no longer truncate with "...".
     cond = city_result.get("conditions", {})
     if cond:
         st.markdown("&nbsp;")
-        st.caption("Current conditions")
-        ccols = st.columns(5)
-        fields = [
-            ("Temp", "temperature_2m", "\u00b0C"),
-            ("Humidity", "relative_humidity_2m", "%"),
-            ("Wind", "wind_speed_10m", "m/s"),
-            ("PM2.5", "pm2_5", "\u00b5g/m\u00b3"),
-            ("PM10", "pm10", "\u00b5g/m\u00b3"),
-        ]
-        for col, (label, key, unit) in zip(ccols, fields):
-            val = cond.get(key)
-            col.metric(label, f"{val:.2f} {unit}" if val is not None else "\u2014")
+        with st.container(border=True):
+            st.caption("Current conditions")
+            ccols = st.columns(5)
+            fields = [("Temp", "temperature_2m", "\u00b0C"), ("Humidity", "relative_humidity_2m", "%"),
+                      ("Wind", "wind_speed_10m", "m/s"), ("PM2.5", "pm2_5", "\u00b5g/m\u00b3"),
+                      ("PM10", "pm10", "\u00b5g/m\u00b3")]
+            for col, (label, key, unit) in zip(ccols, fields):
+                val = cond.get(key)
+                col.metric(label, f"{val:.2f} {unit}" if val is not None else "\u2014")
 
-        if city_result["forecasts"]:
-            st.markdown("&nbsp;")
-            fcols = st.columns(len(city_result["forecasts"]))
-            for i, fc in enumerate(city_result["forecasts"]):
-                with fcols[i]:
-                    delta = None
-                    if city_result["current_aqi"] is not None:
-                        delta = round(fc["predicted_aqi"] - city_result["current_aqi"], 1)
-                    st.metric(
-                        label=f"+{fc['horizon_hours']}h",
-                        value=fc["predicted_aqi"],
-                        delta=delta,
-                        # AQI increasing is bad -> show increases in red, not green
-                        delta_color="inverse",
-                    )
-                    st.caption(f"{fc['category']}  \u00b7  {fc['target_time'][:16]}")
-        else:
-            st.info("No trained model available yet for this city -- run "
-                    "training_pipeline.py at least once.")
-
-    if city_result["recent_history"] or city_result["forecasts"]:
-        st.plotly_chart(
-            build_trend_chart(city_result["recent_history"], city_result["forecasts"],
-                               city_result["current_time"], city_result["current_aqi"]),
-            use_container_width=True, config={"displayModeBar": False},
-        )
+    chart_col, pollutant_col = st.columns([2, 1])
+    with chart_col:
+        if city_result["recent_history"] or city_result["forecasts"]:
+            with st.container(border=True):
+                st.caption("AQI trend: recent history & forecast")
+                st.plotly_chart(
+                    build_trend_chart(city_result["recent_history"], city_result["forecasts"],
+                                       city_result["current_time"], city_result["current_aqi"], theme),
+                    use_container_width=True, config={"displayModeBar": False},
+                )
+    with pollutant_col:
+        if city_result.get("pollutants"):
+            with st.container(border=True):
+                st.caption("Pollutant concentrations")
+                st.plotly_chart(build_pollutant_chart(city_result["pollutants"], theme),
+                                 use_container_width=True, config={"displayModeBar": False})
 
 
 # ---- Page ----
+
+init_theme()
 
 if "cache_bust" not in st.session_state:
     st.session_state.cache_bust = 0
 
 top_left, top_mid, top_right = st.columns([2, 2, 1])
-with top_left:
-    st.title("10Pearls AQI Predictor")
-    st.caption("Air quality forecasts for the next 24h / 48h / 72h")
+
+# Theme toggle is handled BEFORE inject_theme_css() runs below, and
+# deliberately WITHOUT an explicit st.rerun() -- clicking any Streamlit
+# widget (this button included) already triggers Streamlit's own
+# automatic rerun, same as the Refresh button or the city selector,
+# neither of which resets the sidebar. Calling st.rerun() explicitly
+# on top of that automatic rerun was the actual cause of the sidebar
+# snapping back open on every theme toggle: a forced rerun behaves
+# differently from the automatic one every other widget already gets.
+# Updating session_state.theme here, before inject_theme_css() is
+# called further down in this same script pass, is enough on its own
+# to make the CSS reflect the change immediately -- no rerun needed.
+def toggle_theme():
+    st.session_state.theme = (
+        "dark"
+        if st.session_state.theme == "light"
+        else "light"
+    )
+
+inject_theme_css(st.session_state.theme)
 with top_right:
-    st.write("")  # vertical spacer to align button with selectbox
-    refresh_clicked = st.button("Refresh now")
+    st.write("")
+    other_theme = "Dark" if st.session_state.theme == "light" else "Light"
+    theme_icon = ":material/dark_mode:" if st.session_state.theme == "light" else ":material/light_mode:"
+    if st.button(f"Switch to {other_theme}", icon=theme_icon, use_container_width=True,on_click=toggle_theme):
+        st.session_state.theme = "dark" if st.session_state.theme == "light" else "light"
+    refresh_clicked = st.button("Refresh now", icon=":material/refresh:", use_container_width=True)
+
+
+with top_left:
+    st.title("Pearls AQI Predictor")
+    st.caption("Air quality forecasts for the next 24h / 48h / 72h")
 
 if refresh_clicked:
     get_prediction_for_city.clear()
@@ -337,6 +485,7 @@ if refresh_clicked:
     st.session_state.cache_bust += 1
 
 reports = load_reports(st.session_state.cache_bust)
+theme = st.session_state.theme
 
 with st.sidebar:
     st.markdown("### Pearls AQI Predictor")
@@ -350,27 +499,33 @@ with st.sidebar:
     for lo, hi, cat in AQI_BANDS:
         c = CATEGORY_COLOR.get(cat, "#888780")
         label = f"{lo}\u2013{hi}" if hi < 400 else f"{lo}+"
-        st.markdown(
-            f"{svg_dot(c)} **{label}** &nbsp;{cat}",
-            unsafe_allow_html=True,
-        )
+        st.markdown(f"{svg_dot(c)} **{label}** &nbsp;{cat}", unsafe_allow_html=True)
     if reports["training_summary"]:
         st.divider()
         st.markdown("**Current models**")
         for horizon_label, info in sorted(reports["training_summary"].items()):
-            st.markdown(
-                f"**{horizon_label}** \u2014 {info['selected_model']} "
-                f"(R\u00b2 {info['metrics']['r2']:.2f})"
-            )
+            st.markdown(f"**{horizon_label}** \u2014 {info['selected_model']} "
+                        f"(R\u00b2 {info['metrics']['r2']:.2f})")
 
 selected_city = st.selectbox("City", list(CITIES.keys()))
 
 with st.spinner(f"Loading {selected_city}'s forecast..."):
-    city_result = get_prediction_for_city(
-        selected_city, CITIES[selected_city], st.session_state.cache_bust
-    )
+    city_result = get_prediction_for_city(selected_city, CITIES[selected_city], st.session_state.cache_bust)
 
-render_city(city_result)
+render_city(city_result, theme)
+
+# Multi-city comparison -- computes/reuses cached predictions for all
+# three cities (not just the selected one), so this is cheap after the
+# first load of each city within the current cache window.
+st.markdown("&nbsp;")
+with st.container(border=True):
+    st.caption("Current AQI across all cities")
+    city_aqis = {}
+    for c, coords in CITIES.items():
+        r = get_prediction_for_city(c, coords, st.session_state.cache_bust)
+        city_aqis[c] = {"aqi": r["current_aqi"], "category": r["current_category"]}
+    st.plotly_chart(build_city_comparison_chart(city_aqis, theme),
+                     use_container_width=True, config={"displayModeBar": False})
 
 with st.expander("What drives these predictions? (feature importance)"):
     st.caption(
@@ -381,9 +536,9 @@ with st.expander("What drives these predictions? (feature importance)"):
     )
     if reports["shap_images"]:
         for horizon, img_bytes in sorted(reports["shap_images"].items()):
-            st.image(img_bytes, caption=f"+{horizon}h model")
+            render_image_on_white(img_bytes, f"+{horizon}h model")
     else:
-        st.write("Not generated yet — run `python src/shap_analysis.py` after training.")
+        st.write("Not generated yet -- run `python src/shap_analysis.py` after training.")
 
 with st.expander("Pipeline status / logs"):
     st.caption(
@@ -397,11 +552,8 @@ with st.expander("Pipeline status / logs"):
                         unsafe_allow_html=True)
             continue
         dot_color = STATUS_COLOR.get(status["status"], "#888780")
-        st.markdown(
-            f"{svg_dot(dot_color)} **{pipeline_name}** \u2014 {status['status']} "
-            f"at {status['timestamp']}",
-            unsafe_allow_html=True,
-        )
+        st.markdown(f"{svg_dot(dot_color)} **{pipeline_name}** \u2014 {status['status']} "
+                    f"at {status['timestamp']}", unsafe_allow_html=True)
         if status.get("details"):
             st.json(status["details"], expanded=False)
 
@@ -409,12 +561,9 @@ with st.expander("Pipeline status / logs"):
         st.write("**Latest training summary** (best model per horizon):")
         summary_rows = []
         for horizon_label, info in reports["training_summary"].items():
-            summary_rows.append({
-                "horizon": horizon_label,
-                "selected_model": info["selected_model"],
-                "rmse": round(info["metrics"]["rmse"], 2),
-                "r2": round(info["metrics"]["r2"], 3),
-            })
+            summary_rows.append({"horizon": horizon_label, "selected_model": info["selected_model"],
+                                  "rmse": round(info["metrics"]["rmse"], 2),
+                                  "r2": round(info["metrics"]["r2"], 3)})
         st.dataframe(pd.DataFrame(summary_rows), hide_index=True, use_container_width=True)
 
 st.divider()

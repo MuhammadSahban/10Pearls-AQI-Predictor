@@ -45,21 +45,20 @@ def build_city_features(city, lat, lon, past_days=60, forecast_days=1):
     return df
 
 
-def run(past_days=10):
+def run(past_days=5):
     fs = FeatureStore()
     frames = []
-    row_counts = {}
     for city, coords in CITIES.items():
         print(f"[feature_pipeline] fetching {city} ...")
         df = build_city_features(city, coords["lat"], coords["lon"], past_days=past_days)
         frames.append(df)
-        row_counts[city] = len(df)
         print(f"[feature_pipeline] {city}: {len(df)} rows")
 
     all_df = pd.concat(frames, ignore_index=True)
-    fs.save_features(all_df, name=FEATURE_STORE_NAME)
-    print(f"[feature_pipeline] saved {len(all_df)} rows total to '{FEATURE_STORE_NAME}'")
-    return {"total_rows": len(all_df), "rows_by_city": row_counts}
+    saved_df=fs.save_features(all_df, name=FEATURE_STORE_NAME)
+    city_counts = saved_df["city"].value_counts().to_dict()
+    print(f"[feature_pipeline] saved {len(saved_df)} rows total to '{FEATURE_STORE_NAME}'")
+    return {"total_rows": len(saved_df), "rows_by_city": city_counts}
 
 
 if __name__ == "__main__":
