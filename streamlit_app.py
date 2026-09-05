@@ -1,5 +1,5 @@
 """
-Pearls AQI Predictor dashboard.
+10Pearls AQI Predictor dashboard.
 
 Design choice: this app computes predictions LIVE on each load (cached
 for CACHE_TTL_SECONDS), rather than only reading a static JSON file that
@@ -29,7 +29,7 @@ from config import CITIES  # noqa: E402
 import inference_pipeline as inf  # noqa: E402
 from storage import ModelRegistry, ReportStore  # noqa: E402
 
-st.set_page_config(page_title="Pearls AQI Predictor", layout="wide")
+st.set_page_config(page_title="10Pearls AQI Predictor", layout="wide")
 
 CACHE_TTL_SECONDS = 60 * 60  # re-check for a new model / new data hourly
 
@@ -476,7 +476,7 @@ with top_right:
 
 
 with top_left:
-    st.title("Pearls AQI Predictor")
+    st.title("10Pearls AQI Predictor")
     st.caption("Air quality forecasts for the next 24h / 48h / 72h")
 
 if refresh_clicked:
@@ -488,7 +488,7 @@ reports = load_reports(st.session_state.cache_bust)
 theme = st.session_state.theme
 
 with st.sidebar:
-    st.markdown("### Pearls AQI Predictor")
+    st.markdown("### 10Pearls AQI Predictor")
     st.caption(
         "24h / 48h / 72h AQI forecasts for Karachi, Lahore, and Islamabad. "
         "Live inference, best-of-3 models per horizon, storage backend: "
